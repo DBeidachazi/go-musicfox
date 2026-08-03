@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/anhoder/foxful-cli/model"
@@ -84,6 +85,15 @@ type Player struct {
 	stateHandler *control.RemoteControl
 	ctrl         chan CtrlSignal
 
+	crossfadeMu              sync.Mutex
+	crossfadeTransitionCount int
+	crossfadeTriggered       bool
+	crossfadeObservedSongID  int64
+	crossfadeLastPosition    time.Duration
+	crossfadeObserved        bool
+	crossfadeSeekSuppressed  bool
+	crossfadePlayNextDirect  bool
+
 	renderTicker *tickerByPlayer // renderTicker 用于渲染
 
 	player.Player // 播放器
@@ -134,10 +144,16 @@ func NewPlayer(n *Netease, lyricService *lyric.Service) *Player {
 			case <-ctx.Done():
 				return
 			case s := <-p.StateChan():
-			p.stateHandler.SetPlayingInfo(p.PlayingInfo())
-			p.updateDesktopLyrics()
-			if s != types.Stopped {
+				p.stateHandler.SetPlayingInfo(p.PlayingInfo())
+				p.updateDesktopLyrics()
+				if s != types.Stopped {
 					p.netease.Rerender(false)
+					break
+				}
+				if p.crossfadeTransitionPending() {
+					break
+				}
+				if p.playPreparedNextDirectly() {
 					break
 				}
 				p.NextSong(false)
@@ -153,6 +169,10 @@ func NewPlayer(n *Netease, lyricService *lyric.Service) *Player {
 				return
 			case duration := <-p.TimeChan():
 				p.stateHandler.SetPosition(p.PassedTime())
+				if p.shouldStartCrossfade(duration) {
+					p.nextSongWithCrossfade()
+					continue
+				}
 				if duration.Seconds()-p.CurMusic().Duration.Seconds() > 10 {
 					p.NextSong(false)
 				}
@@ -173,6 +193,127 @@ func NewPlayer(n *Netease, lyricService *lyric.Service) *Player {
 	})
 
 	return p
+}
+
+func (p *Player) crossfadeDuration() time.Duration {
+	provider, ok := p.Player.(player.CrossfadeProvider)
+	if !ok {
+		return 0
+	}
+	return provider.CrossfadeDuration()
+}
+
+func (p *Player) beginCrossfadeTransition() bool {
+	if p.crossfadeDuration() <= 0 || p.State() != types.Playing {
+		return false
+	}
+	p.crossfadeMu.Lock()
+	p.crossfadeTransitionCount++
+	p.crossfadeMu.Unlock()
+	return true
+}
+
+func (p *Player) endCrossfadeTransition() {
+	p.crossfadeMu.Lock()
+	if p.crossfadeTransitionCount > 0 {
+		p.crossfadeTransitionCount--
+	}
+	p.crossfadeMu.Unlock()
+}
+
+func (p *Player) crossfadeTransitionPending() bool {
+	p.crossfadeMu.Lock()
+	pending := p.crossfadeTransitionCount > 0
+	p.crossfadeMu.Unlock()
+	if pending {
+		return true
+	}
+	provider, ok := p.Player.(player.CrossfadeProvider)
+	return ok && provider.CrossfadePending()
+}
+
+func (p *Player) shouldStartCrossfade(passed time.Duration) bool {
+	crossfadeDuration := p.crossfadeDuration()
+	current := p.CurMusic()
+	if crossfadeDuration <= 0 || p.State() != types.Playing || current.Duration <= 0 {
+		return false
+	}
+
+	p.crossfadeMu.Lock()
+	defer p.crossfadeMu.Unlock()
+	crossfadeStart := current.Duration - crossfadeDuration
+	if crossfadeStart < 0 {
+		crossfadeStart = 0
+	}
+	if current.Id != p.crossfadeObservedSongID {
+		p.crossfadeObservedSongID = current.Id
+		p.crossfadeLastPosition = passed
+		p.crossfadeObserved = true
+		p.crossfadeTriggered = false
+		p.crossfadeSeekSuppressed = false
+		return false
+	}
+	previous := p.crossfadeLastPosition
+	p.crossfadeLastPosition = passed
+	if passed < previous {
+		p.crossfadeTriggered = false
+		p.crossfadeSeekSuppressed = false
+		return false
+	}
+	if p.crossfadeTransitionCount > 0 {
+		return false
+	}
+	if p.crossfadeTriggered || p.crossfadeSeekSuppressed {
+		return false
+	}
+	if !p.crossfadeObserved {
+		p.crossfadeObserved = true
+		return false
+	}
+	if passed <= previous || previous >= crossfadeStart || passed < crossfadeStart || passed >= current.Duration {
+		return false
+	}
+	p.crossfadeTriggered = true
+	return true
+}
+
+func (p *Player) noteCrossfadeSeek(duration time.Duration) {
+	crossfadeDuration := p.crossfadeDuration()
+	current := p.CurMusic()
+	if crossfadeDuration <= 0 || current.Duration <= 0 {
+		return
+	}
+	crossfadeStart := current.Duration - crossfadeDuration
+	if crossfadeStart < 0 {
+		crossfadeStart = 0
+	}
+
+	p.crossfadeMu.Lock()
+	p.crossfadeObservedSongID = current.Id
+	p.crossfadeLastPosition = duration
+	p.crossfadeObserved = true
+	p.crossfadeTriggered = false
+	p.crossfadeSeekSuppressed = duration >= crossfadeStart
+	p.crossfadeMu.Unlock()
+}
+
+func (p *Player) suppressPreparedCrossfadeAfterSeek() {
+	p.crossfadeMu.Lock()
+	p.crossfadeSeekSuppressed = true
+	p.crossfadePlayNextDirect = true
+	p.crossfadeMu.Unlock()
+}
+
+func (p *Player) playPreparedNextDirectly() bool {
+	p.crossfadeMu.Lock()
+	playDirect := p.crossfadePlayNextDirect
+	p.crossfadePlayNextDirect = false
+	p.crossfadeMu.Unlock()
+	if !playDirect {
+		return false
+	}
+	p.PlaySong(p.CurSong(), DurationNext)
+	return true
 }
 
 // InPlayingMenu 是否处于正在播放的菜单中
@@ -234,6 +375,25 @@ func (p *Player) LocatePlayingSong() {
 
 // PlaySong 播放歌曲
 func (p *Player) PlaySong(song structs.Song, direction PlayDirection) {
+	p.playSong(song, direction, false)
+}
+
+func (p *Player) playSong(song structs.Song, direction PlayDirection, crossfade bool) {
+	provider, supportsCrossfade := p.Player.(player.CrossfadeProvider)
+	if !crossfade && supportsCrossfade {
+		p.crossfadeMu.Lock()
+		p.crossfadePlayNextDirect = false
+		p.crossfadeMu.Unlock()
+		provider.CancelCrossfade()
+	}
+	crossfading := crossfade && p.beginCrossfadeTransition()
+	var crossfadeProvider player.CrossfadeProvider
+	var crossfadeGeneration int64
+	if crossfading {
+		defer p.endCrossfadeTransition()
+		crossfadeProvider = provider
+		crossfadeGeneration = crossfadeProvider.CrossfadeGeneration()
+	}
 	p.reporter.ReportEnd(p.PlayedTime())
 
 	loading := model.NewLoading(p.netease.MustMain())
@@ -248,8 +408,13 @@ func (p *Player) PlaySong(song structs.Song, direction PlayDirection) {
 	})
 
 	p.LocatePlayingSong()
-	p.Pause()
+	if !crossfading {
+		p.Pause()
+	}
 	url, musicType, err := p.getPlayInfo(song)
+	if crossfading && crossfadeProvider.CrossfadeGeneration() != crossfadeGeneration {
+		return
+	}
 
 	var skip bool
 	logger := slog.With(slog.String("url", url), slog.String("type", musicType), slog.Any("song", song))
@@ -280,11 +445,16 @@ func (p *Player) PlaySong(song structs.Song, direction PlayDirection) {
 		p.lyricService.SetSong(context.Background(), song)
 	}, true)
 
-	p.Play(player.URLMusic{
+	music := player.URLMusic{
 		URL:  url,
 		Song: song,
 		Type: player.SongTypeMapping[musicType],
-	})
+	}
+	if crossfading {
+		crossfadeProvider.PlayCrossfade(music)
+	} else {
+		p.Play(music)
+	}
 	slog.Info("Start play song", slog.String("url", url), slog.String("type", musicType), slog.Any("song", song))
 
 	// 上报开始播放
@@ -334,6 +504,29 @@ func (p *Player) CurSong() structs.Song {
 
 // NextSong 下一曲
 func (p *Player) NextSong(manual bool) {
+	if manual && p.crossfadePreparingNextSong() {
+		p.PlaySong(p.CurSong(), DurationNext)
+		return
+	}
+	p.nextSong(manual, false)
+}
+
+func (p *Player) crossfadePreparingNextSong() bool {
+	p.crossfadeMu.Lock()
+	preparing := p.crossfadeTransitionCount > 0
+	p.crossfadeMu.Unlock()
+	if !preparing {
+		provider, ok := p.Player.(player.CrossfadeProvider)
+		preparing = ok && provider.CrossfadePending()
+	}
+	return preparing && p.CurMusic().Id != p.CurSong().Id
+}
+
+func (p *Player) nextSongWithCrossfade() {
+	p.nextSong(false, true)
+}
+
+func (p *Player) nextSong(manual, crossfade bool) {
 	index := p.CurSongIndex()
 	playlistLen := len(p.Playlist())
 
@@ -360,7 +553,7 @@ func (p *Player) NextSong(manual bool) {
 		return
 	}
 
-	p.PlaySong(song, DurationNext)
+	p.playSong(song, DurationNext, crossfade)
 }
 
 // PreviousSong 上一曲
@@ -388,6 +581,14 @@ func (p *Player) PreviousSong(manual bool) {
 }
 
 func (p *Player) Seek(duration time.Duration) {
+	preparingNext := p.crossfadePreparingNextSong()
+	if provider, ok := p.Player.(player.CrossfadeProvider); ok {
+		provider.CancelCrossfade()
+	}
+	p.noteCrossfadeSeek(duration)
+	if preparingNext {
+		p.suppressPreparedCrossfadeAfterSeek()
+	}
 	p.Player.Seek(duration)
 	p.stateHandler.SetPlayingInfo(p.PlayingInfo())
 	p.stateHandler.EmitSeeked(duration)

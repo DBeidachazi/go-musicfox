@@ -38,6 +38,10 @@ type PlayerConfig struct {
 type BeepConfig struct {
 	// beep mp3解码器
 	Mp3Decoder string `koanf:"mp3Decoder"`
+	// Crossfade enables overlap while switching tracks.
+	Crossfade bool `koanf:"crossfade"`
+	// CrossfadeDuration is the maximum adaptive overlap duration in seconds.
+	CrossfadeDuration int `koanf:"crossfadeDuration"`
 }
 
 // MpdConfig `mpd` 引擎专属配置

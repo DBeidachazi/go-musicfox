@@ -30,6 +30,15 @@ type Player interface {
 	Close()
 }
 
+// CrossfadeProvider exposes the optional automatic transition path.
+type CrossfadeProvider interface {
+	CrossfadeDuration() time.Duration
+	CrossfadePending() bool
+	CrossfadeGeneration() int64
+	PlayCrossfade(music URLMusic)
+	CancelCrossfade()
+}
+
 func NewPlayerFromConfig() Player {
 	cfg := configs.AppConfig
 	var player Player

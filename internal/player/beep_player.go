@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gopxl/beep"
@@ -44,27 +45,46 @@ type beepPlayer struct {
 	curStreamer beep.StreamSeekCloser
 	curFormat   beep.Format
 
-	state      types.State
-	ctrl       *beep.Ctrl
-	volume     *effects.Volume
-	timeChan   chan time.Duration
-	stateChan  chan types.State
-	musicChan  chan URLMusic
-	httpClient *http.Client
+	state              types.State
+	ctrl               *beep.Ctrl
+	volume             *effects.Volume
+	timeChan           chan time.Duration
+	stateChan          chan types.State
+	musicChan          chan URLMusic
+	crossfadeMusicChan chan beepCrossfadeRequest
+	httpClient         *http.Client
 
 	close chan struct{}
 
 	spectrum         *PCMAnalyzer
 	spectrumConsumer func(sampleRate float64, samplesL, samplesR []float32)
+
+	crossfadeDuration      time.Duration
+	crossfadeMixer         *beep.Mixer
+	crossfadePlayback      *beep.Ctrl
+	crossfadeCurrent       *beepCrossfadeTrack
+	crossfadeCurrentStream beep.Streamer
+	crossfadeOutgoing      []*beepCrossfadeTrack
+	crossfadeRequestID     atomic.Int64
+	crossfadePendingID     atomic.Int64
+	crossfadeGeneration    atomic.Int64
+	crossfadePrepareCancel context.CancelFunc
+	crossfadeClosed        bool
 }
 
 func NewBeepPlayer() *beepPlayer {
+	var crossfadeDuration time.Duration
+	if configs.AppConfig.Player.Beep.Crossfade && configs.AppConfig.Player.Beep.CrossfadeDuration > 0 {
+		crossfadeDuration = time.Duration(configs.AppConfig.Player.Beep.CrossfadeDuration) * time.Second
+	}
 	p := &beepPlayer{
-		state: types.Stopped,
+		state:             types.Stopped,
+		crossfadeDuration: crossfadeDuration,
 
-		timeChan:  make(chan time.Duration, 1),
-		stateChan: make(chan types.State, 10),
-		musicChan: make(chan URLMusic, 1),
+		timeChan:           make(chan time.Duration, 1),
+		stateChan:          make(chan types.State, 10),
+		musicChan:          make(chan URLMusic, 1),
+		crossfadeMusicChan: make(chan beepCrossfadeRequest, 1),
 		ctrl: &beep.Ctrl{
 			Paused: false,
 		},
@@ -80,7 +100,11 @@ func NewBeepPlayer() *beepPlayer {
 		p.spectrum = NewPCMAnalyzer(configs.AppConfig.Main.FrameRate.Interval())
 	}
 
-	errorx.WaitGoStart(p.listen)
+	if p.crossfadeDuration > 0 {
+		errorx.WaitGoStart(p.listenCrossfade)
+	} else {
+		errorx.WaitGoStart(p.listen)
+	}
 
 	return p
 }
@@ -242,6 +266,11 @@ func (p *beepPlayer) listen() {
 
 // Play 播放音乐
 func (p *beepPlayer) Play(music URLMusic) {
+	if p.crossfadeDuration > 0 {
+		p.CancelCrossfade()
+		p.enqueueCrossfadeRequest(music, false)
+		return
+	}
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	select {
@@ -250,8 +279,65 @@ func (p *beepPlayer) Play(music URLMusic) {
 	}
 }
 
+func (p *beepPlayer) PlayCrossfade(music URLMusic) {
+	if p.crossfadeDuration <= 0 {
+		p.Play(music)
+		return
+	}
+	p.enqueueCrossfadeRequest(music, true)
+}
+
+func (p *beepPlayer) enqueueCrossfadeRequest(music URLMusic, crossfade bool) {
+	p.l.Lock()
+	closed := p.crossfadeClosed
+	p.l.Unlock()
+	if closed {
+		return
+	}
+	requestID := p.crossfadeRequestID.Add(1)
+	request := beepCrossfadeRequest{
+		music:      music,
+		generation: p.crossfadeGeneration.Load(),
+		crossfade:  crossfade,
+		id:         requestID,
+	}
+	p.crossfadePendingID.Store(requestID)
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case p.crossfadeMusicChan <- request:
+	case <-timer.C:
+		p.crossfadePendingID.CompareAndSwap(requestID, 0)
+	}
+}
+
+func (p *beepPlayer) CancelCrossfade() {
+	if p.crossfadeDuration <= 0 {
+		return
+	}
+	p.l.Lock()
+	p.crossfadeGeneration.Add(1)
+	p.crossfadePendingID.Store(0)
+	if p.crossfadePrepareCancel != nil {
+		p.crossfadePrepareCancel()
+	}
+	p.l.Unlock()
+}
+
 func (p *beepPlayer) CurMusic() URLMusic {
 	return p.curMusic
+}
+
+func (p *beepPlayer) CrossfadeDuration() time.Duration {
+	return p.crossfadeDuration
+}
+
+func (p *beepPlayer) CrossfadePending() bool {
+	return p.crossfadePendingID.Load() > 0
+}
+
+func (p *beepPlayer) CrossfadeGeneration() int64 {
+	return p.crossfadeGeneration.Load()
 }
 
 func (p *beepPlayer) setState(state types.State) {
@@ -273,6 +359,15 @@ func (p *beepPlayer) StateChan() <-chan types.State {
 }
 
 func (p *beepPlayer) PassedTime() time.Duration {
+	if p.crossfadeDuration > 0 {
+		p.l.Lock()
+		track := p.crossfadeCurrent
+		p.l.Unlock()
+		if track == nil {
+			return 0
+		}
+		return track.PassedTime()
+	}
 	if p.curStreamer == nil {
 		return 0
 	}
@@ -292,6 +387,10 @@ func (p *beepPlayer) TimeChan() <-chan time.Duration {
 }
 
 func (p *beepPlayer) Seek(duration time.Duration) {
+	if p.crossfadeDuration > 0 {
+		p.seekCrossfade(duration)
+		return
+	}
 	if duration < 0 || !p.cacheDownloaded {
 		return
 	}
@@ -376,6 +475,16 @@ func (p *beepPlayer) pausedNoLock() {
 	if p.state != types.Playing {
 		return
 	}
+	if p.crossfadeDuration > 0 {
+		speaker.Lock()
+		p.ctrl.Paused = true
+		speaker.Unlock()
+		if p.timer != nil {
+			p.timer.Pause()
+		}
+		p.setState(types.Paused)
+		return
+	}
 	p.ctrl.Paused = true
 	p.timer.Pause()
 	p.setState(types.Paused)
@@ -392,6 +501,16 @@ func (p *beepPlayer) resumeNoLock() {
 	if p.state == types.Playing {
 		return
 	}
+	if p.crossfadeDuration > 0 {
+		speaker.Lock()
+		p.ctrl.Paused = false
+		speaker.Unlock()
+		if p.timer != nil {
+			go p.timer.Run()
+		}
+		p.setState(types.Playing)
+		return
+	}
 	p.ctrl.Paused = false
 	go p.timer.Run()
 	p.setState(types.Playing)
@@ -405,6 +524,16 @@ func (p *beepPlayer) Resume() {
 }
 
 func (p *beepPlayer) stopNoLock() {
+	if p.crossfadeDuration > 0 {
+		p.crossfadeGeneration.Add(1)
+		if p.crossfadePrepareCancel != nil {
+			p.crossfadePrepareCancel()
+		}
+		if p.state != types.Stopped {
+			p.stopCrossfadeNoLock()
+		}
+		return
+	}
 	if p.state == types.Stopped {
 		return
 	}
@@ -436,6 +565,10 @@ func (p *beepPlayer) Toggle() {
 func (p *beepPlayer) Close() {
 	p.l.Lock()
 	defer p.l.Unlock()
+	if p.crossfadeDuration > 0 {
+		p.closeCrossfadeNoLock()
+		return
+	}
 
 	if p.timer != nil {
 		p.timer.Stop()

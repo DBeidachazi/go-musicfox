@@ -324,6 +324,10 @@ mouseVolumeStep = 1
 # MP3解码器，可选: "go-mp3", "minimp3"
 # "minimp3" CPU占用更低，但稳定性可能稍逊于 "go-mp3"
 mp3Decoder = "go-mp3"
+# 是否启用歌曲切换时的交叉淡化（实验性）
+crossfade = false
+# 交叉淡化最大时长（秒）；实际时长根据歌曲衔接处的音频特征自适应缩短
+crossfadeDuration = 5
 
 # `mpd` 引擎专属配置，需要安装mpd
 [player.mpd]
