@@ -17,6 +17,7 @@ import (
 	minimp3pkg "github.com/tosone/minimp3"
 
 	"github.com/go-musicfox/go-musicfox/internal/automix"
+	"github.com/go-musicfox/go-musicfox/internal/automix/models"
 	"github.com/go-musicfox/go-musicfox/internal/configs"
 	"github.com/go-musicfox/go-musicfox/utils/app"
 )
@@ -57,17 +58,22 @@ type activeBlend struct {
 
 // automixState 过渡的全部状态。
 //
-// 锁序：p.l 可以在持有时再取 a.mu，反之不行。profiles / hints / analysing 受 a.mu 保护；
+// 锁序：p.l 可以在持有时再取 a.mu，反之不行。profiles / hints / analysing / stems 受 a.mu 保护；
 // plan / blend / meter / scratch 只在持有 p.l 时访问。
 type automixState struct {
 	settings automix.Settings
+	// engine 可选模型（L1/L2），未配置时为 nil。
+	engine *models.Engine
 
-	mu        sync.Mutex
-	profiles  map[int64]*automix.TrackProfile
-	order     []int64
-	analysing map[int64]bool
-	failed    map[int64]bool
-	hints     map[int64]lyricHint
+	mu         sync.Mutex
+	stems      map[stemKey]*automix.StemWindow
+	stemOrder  []stemKey
+	separating map[stemKey]bool
+	profiles   map[int64]*automix.TrackProfile
+	order      []int64
+	analysing  map[int64]bool
+	failed     map[int64]bool
+	hints      map[int64]lyricHint
 
 	planning bool
 	plan     *automix.TransitionPlan
@@ -83,13 +89,19 @@ type automixState struct {
 const automixProfileCacheSize = 32
 
 func newAutomixState(settings automix.Settings) *automixState {
-	return &automixState{
-		settings:  settings,
-		profiles:  make(map[int64]*automix.TrackProfile),
-		analysing: make(map[int64]bool),
-		failed:    make(map[int64]bool),
-		hints:     make(map[int64]lyricHint),
+	a := &automixState{
+		settings:   settings,
+		profiles:   make(map[int64]*automix.TrackProfile),
+		analysing:  make(map[int64]bool),
+		failed:     make(map[int64]bool),
+		hints:      make(map[int64]lyricHint),
+		stems:      make(map[stemKey]*automix.StemWindow),
+		separating: make(map[stemKey]bool),
 	}
+	if settings.Mode == automix.ModeAutomix {
+		a.engine = automixEngine()
+	}
+	return a
 }
 
 func (a *automixState) profile(id int64) (*automix.TrackProfile, bool) {
@@ -174,11 +186,15 @@ func (a *automixState) ensureProfile(music URLMusic, path string) *automix.Track
 	a.mu.Unlock()
 
 	if p := loadCachedProfile(id); p != nil {
-		a.storeProfile(id, p)
-		return p
+		// 模型没跑过的旧档案，在模型就绪后重测一次，换成模型给出的网格。
+		if !(p.Gridless && a.engine.BeatThisReady()) {
+			a.storeProfile(id, p)
+			return p
+		}
+		slog.Info("automix re-measuring with Beat This!", "song_id", id)
 	}
 	started := time.Now()
-	p, err := analyseFile(path, music)
+	p, err := analyseFile(path, music, a.engine)
 	switch {
 	case errors.Is(err, errAnalysisUnsupported):
 		slog.Info("automix skips analysis for this format", "song_id", id, "type", music.Type)
@@ -223,7 +239,7 @@ func describeProfile(p *automix.TrackProfile) string {
 var errAnalysisUnsupported = errors.New("format not analysed")
 
 // analyseFile 完整解码一个本地文件、降为 22050Hz 的单声道 + 侧声道，交给 AnalyseTrack。
-func analyseFile(path string, music URLMusic) (*automix.TrackProfile, error) {
+func analyseFile(path string, music URLMusic, engine *models.Engine) (*automix.TrackProfile, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -291,7 +307,8 @@ func analyseFile(path string, music URLMusic) (*automix.TrackProfile, error) {
 			break
 		}
 	}
-	opts := automix.AnalyseOptions{Gridless: true}
+	opts := automix.AnalyseOptions{}
+	opts.Grid, opts.Gridless = beatGridFor(engine, mono)
 	if !silentSide {
 		opts.Side = side
 	}
@@ -332,29 +349,41 @@ func (p *beepPlayer) SetAutomixLyrics(songID int64, lastSung *float64, hasLyrics
 	p.automix.mu.Unlock()
 }
 
-// analyseCurrent 当前曲目下载完成后在后台分析它（作为之后的出场曲）。
+// analyseCurrent 当前曲目下载完成后在后台分析它（作为之后的出场曲），并分离它的曲尾。
 func (p *beepPlayer) analyseCurrent(path string, music URLMusic) {
 	if p.automix == nil || p.automix.settings.Mode != automix.ModeAutomix {
 		return
 	}
 	// 复制一份：beep_playing 会在下一次 Play 时被截断重写。
-	tmp, err := os.CreateTemp(app.RuntimeDir(), "beep_automix_*")
+	tmp, err := copyToTemp(path, "beep_automix_*")
 	if err != nil {
 		return
 	}
-	defer os.Remove(tmp.Name())
-	src, err := os.Open(path)
-	if err != nil {
-		_ = tmp.Close()
+	defer os.Remove(tmp)
+	p.automix.ensureProfile(music, tmp)
+	p.l.Lock()
+	rate := p.gaplessOutputRate
+	p.l.Unlock()
+	p.automix.ensureStems(music, tmp, automix.RoleTail, rate)
+}
+
+// analyseNext 下一首预加载完成时：同步测档案（计划要用），曲首分离放到后台。
+func (p *beepPlayer) analyseNext(prepared *preparedGapless) {
+	a := p.automix
+	a.ensureProfile(prepared.music, prepared.file.Name())
+	if !a.claimStems(prepared.music.Id, automix.RoleHead) {
 		return
 	}
-	_, err = io.Copy(tmp, src)
-	_ = src.Close()
-	_ = tmp.Close()
+	// 预加载的临时文件在交出或取消时会被删除，分离要读它半分钟，先复制一份。
+	tmp, err := copyToTemp(prepared.file.Name(), "beep_automix_*")
 	if err != nil {
+		a.storeStems(stemKey{prepared.music.Id, automix.RoleHead}, nil)
 		return
 	}
-	p.automix.ensureProfile(music, tmp.Name())
+	go func() {
+		defer os.Remove(tmp)
+		a.separateStems(prepared.music, tmp, automix.RoleHead, prepared.outputRate)
+	}()
 }
 
 // beepPlayerSeconds 当前曲目位置与长度（秒），需持有 p.l。
@@ -387,8 +416,9 @@ func (p *beepPlayer) maybePlanNoLock() {
 	}
 	pos, length := p.positionNoLock()
 	if a.settings.Mode == automix.ModeAutomix {
-		// 出场曲档案还在分析时稍等，但不能等到过渡该开始的时候。
-		if _, done := a.profile(from); !done && length-pos > automix.MaxOverlapSec+15 {
+		// 出场曲档案还在分析、或这一对还在分离时稍等，但不能等到过渡该开始的时候。
+		_, done := a.profile(from)
+		if (!done || a.stemsPending(from, next.Id)) && length-pos > automix.MaxOverlapSec+15 {
 			return
 		}
 	}
@@ -409,6 +439,13 @@ func (p *beepPlayer) planTransition(fromMusic, toMusic URLMusic, at, length floa
 	}
 	if to.Profile != nil {
 		to.Duration = to.Profile.Duration
+	}
+	if a.settings.Mode == automix.ModeAutomix {
+		tail, _, fromExt, toExt := a.separatedExtents(fromMusic.Id, toMusic.Id)
+		from.Separated, to.Separated = fromExt, toExt
+		if tail != nil {
+			from.VocalEnd = tail.VocalEnd
+		}
 	}
 	var bpm *float64
 	if from.Profile != nil {
@@ -592,8 +629,10 @@ func (p *beepPlayer) startBlendNoLock(tail beep.Streamer, outputRate beep.Sample
 	if shape.Overlap >= automix.MinOverlapSec && fromProfile != nil && toProfile != nil {
 		trimDB = automix.TrimForBalance(fromProfile.Loudness, toProfile.Loudness)
 	}
+	gesture, noStems := p.planStemGestureNoLock(plan, shape, pos, fromID, a.planTo, fromProfile, toProfile, outputRate)
 	mixer := automix.NewMixer(automix.MixerConfig{
 		SampleRate: float64(outputRate), Blend: shape, Plan: plan, TrimDB: trimDB, PeriodSec: periodSec,
+		Stems: gesture,
 	})
 
 	var log strings.Builder
@@ -612,13 +651,19 @@ func (p *beepPlayer) startBlendNoLock(tail beep.Streamer, outputRate beep.Sample
 	if shape.Together > 0 {
 		fmt.Fprintf(&log, ", both held for %d%%", int(math.Round(shape.Together*100)))
 	}
-	if shape.ShapeBands {
+	switch {
+	case gesture != nil:
+		log.WriteString(", four stems")
+	case noStems != "":
+		log.WriteString(", " + noStems)
+	}
+	if shape.ShapeBands && gesture == nil {
 		log.WriteString(", three bands")
 	}
-	if shape.SweepOut {
+	if shape.SweepOut && gesture == nil {
 		log.WriteString(", swept out")
 	}
-	if plan.EchoThrow {
+	if plan.EchoThrow && gesture == nil {
 		log.WriteString(", thrown")
 	}
 	if plan.Stretch != 1 {
@@ -634,6 +679,9 @@ func (p *beepPlayer) startBlendNoLock(tail beep.Streamer, outputRate beep.Sample
 		fmt.Fprintf(&log, ", outgoing trimmed %.1f dB", trimDB)
 	}
 	slog.Info("automix blend", "from", p.curMusic.Name, "to", prepared.music.Name, "detail", log.String())
+	if gesture != nil {
+		slog.Info("automix stems", "detail", describeStemGesture(gesture))
+	}
 
 	release := p.swapToPreparedNoLock(prepared, true)
 	a.blend = &activeBlend{tail: tail, release: release, mixer: mixer}

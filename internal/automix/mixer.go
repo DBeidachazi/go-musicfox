@@ -141,6 +141,9 @@ type MixerConfig struct {
 	TrimDB float64
 	// PeriodSec 出场曲拍长，决定回声的间隔。nil 用默认 0.25s。
 	PeriodSec *float64
+	// Stems 两端都分离过时的四轨交接。非 nil 时重叠段由它执行，
+	// 取代三频段交叉淡化与回声（四轨手法本身就是低频交接）。
+	Stems *StemGesture
 }
 
 // Mixer 一次过渡的逐采样混合器。时间轴：[0, hold) 出场曲独奏、进场曲静音走过自己的前导静音；
@@ -160,6 +163,7 @@ type Mixer struct {
 	delayIdx int
 	rampTrim int
 	ringEnd  int
+	stems    *stemPlayer
 }
 
 // NewMixer 构造混合器。
@@ -171,6 +175,12 @@ func NewMixer(cfg MixerConfig) *Mixer {
 		overlap:  max(1, int(math.Round(cfg.Blend.Overlap*rate))),
 		trim:     DbToGain(-cfg.TrimDB),
 		rampTrim: int(balanceRampSec * rate),
+	}
+	if cfg.Stems != nil {
+		m.stems = newStemPlayer(cfg.Stems, rate)
+		cfg.Blend.ShapeBands = false
+		cfg.Plan.EchoThrow = false
+		m.cfg = cfg
 	}
 	if cfg.Blend.ShapeBands {
 		m.bands = BandBlendRequest{
@@ -200,6 +210,9 @@ func NewMixer(cfg MixerConfig) *Mixer {
 	}
 	return m
 }
+
+// StemsActive 这次过渡走四轨交接。
+func (m *Mixer) StemsActive() bool { return m.stems != nil }
 
 // Done 过渡与回声尾巴都已结束，出场曲可以释放。
 func (m *Mixer) Done() bool { return m.pos >= m.ringEnd }
@@ -250,6 +263,13 @@ func (m *Mixer) Process(dst, outgoing, incoming [][2]float64) {
 		}
 		a[0] *= trim
 		a[1] *= trim
+
+		if m.stems != nil && t >= 0 && t < m.overlap {
+			mix := m.stems.mix(t, a, b, trim)
+			dst[i] = [2]float64{SoftLimit(mix[0]), SoftLimit(mix[1])}
+			m.pos++
+			continue
+		}
 
 		if m.outTone != nil {
 			if m.pos%coeffUpdateEvery == 0 {

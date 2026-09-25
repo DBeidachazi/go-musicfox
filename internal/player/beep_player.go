@@ -84,9 +84,7 @@ func NewBeepPlayer() *beepPlayer {
 		p.automix = newAutomixState(settings)
 		p.gapless = newGaplessState()
 		if settings.Mode == automix.ModeAutomix {
-			p.gapless.onPrepared = func(prepared *preparedGapless) {
-				p.automix.ensureProfile(prepared.music, prepared.file.Name())
-			}
+			p.gapless.onPrepared = p.analyseNext
 		}
 	} else if configs.AppConfig.Player.Beep.Gapless {
 		p.gapless = newGaplessState()

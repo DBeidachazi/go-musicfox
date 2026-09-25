@@ -15,7 +15,17 @@ type TransitionTrack struct {
 	// HasLyrics 是否拿到了歌词（仅用于日志区分"无歌词"与"歌词里没唱"）。
 	HasLyrics bool
 	Profile   *TrackProfile
+	// VocalEnd 由分离出的人声测得的最后演唱时刻（曲中秒数，仅出场曲）。nil 表示没测到：
+	// 未分离、窗口还没好，或曲尾窗口里根本没唱。有它时优先于歌词——歌词的结束时刻常是
+	// 最后一句起点加五秒的估计，不是测量。
+	VocalEnd *float64
+	// Separated 四轨手法为这一端持有的分离窗口（曲中秒数），nil 表示没有。
+	// 一个窗口存在即能托住人声，它的范围就是能托多长的过渡——同一件事，所以是同一个字段。
+	Separated *Extent
 }
+
+// Extent 曲中的一段 [From, To)，秒。
+type Extent struct{ From, To float64 }
 
 // TransitionKind 硬切或过渡。
 type TransitionKind string
@@ -153,7 +163,16 @@ func PlanTransition(from, to TransitionTrack, bpm *float64, at float64) Transiti
 	}
 
 	beat := beatSecOf(bpm)
-	lastSung := from.LastSung
+	// 有测量时直接用测量，而不是取两者较晚的：歌词结束时刻是个五秒常数，
+	// 取 max 会让一个编出来的数大约一半时候把测得的下限推后。猜测对测量没有投票权。
+	lastSung, sungFrom := from.LastSung, "the lyric file"
+	sungGap := ""
+	if from.VocalEnd != nil {
+		lastSung, sungFrom = from.VocalEnd, "the vocal stem"
+		if from.LastSung != nil && math.Abs(*from.VocalEnd-*from.LastSung) > 0.5 {
+			sungGap = ", the lyric file said " + fmtS(*from.LastSung)
+		}
+	}
 	var tail *float64
 	if lastSung != nil {
 		tail = ptr(math.Max(0, end-*lastSung))
@@ -185,13 +204,24 @@ func PlanTransition(from, to TransitionTrack, bpm *float64, at float64) Transiti
 		toLeadIn = to.Profile.LeadIn
 	}
 	entryFloor := math.Min(maxTrimmedTailSec, math.Max(0, toLeadIn-EntryMarginSec))
+	// 两个分离窗口实际能托住的最长过渡。手法拒绝任何两端没被窗口盖住的过渡、退回主交叉淡化，
+	// 而那是唯一托不住人声的执行器。后端：过渡最晚在 end 结束，整段须在 end 与首个分离采样之间；
+	// 前端：进场窗口还要盖住起播点（最多 maxTrimmedTailSec）。留一拍给对齐。
+	gestureRoom := math.Inf(1)
+	if from.Separated != nil && to.Separated != nil {
+		slack := 0.0
+		if beat != nil {
+			slack = *beat
+		}
+		gestureRoom = math.Max(0, math.Min(end-from.Separated.From, to.Separated.To-entryFloor-slack))
+	}
 
 	wanted := defaultOverlapSec
 	if beat != nil {
 		wanted = *beat * defaultOverlapBeats
 	}
 	wanted *= choice.LengthScale
-	ceiling := math.Min(math.Min(MaxOverlapSec, end/4), math.Min(singleVoiceRoom, left))
+	ceiling := math.Min(math.Min(math.Min(MaxOverlapSec, end/4), math.Min(singleVoiceRoom, left)), gestureRoom)
 	overlap := QuantiseToMusic(math.Min(wanted, ceiling), beat, ceiling)
 
 	if overlap < MinOverlapSec {
@@ -306,7 +336,7 @@ func PlanTransition(from, to TransitionTrack, bpm *float64, at float64) Transiti
 	if lastSung == nil {
 		extra.WriteString(", nothing says where the singing stops")
 	} else {
-		extra.WriteString(", sung to " + fmtS(*lastSung) + " off the lyric file")
+		extra.WriteString(", sung to " + fmtS(*lastSung) + " off " + sungFrom + sungGap)
 	}
 	extra.WriteString(silence + clipped + fadeOut + placed)
 	apart := int(math.Round(math.Abs(choice.Tempo.Ratio-1) * 100))
