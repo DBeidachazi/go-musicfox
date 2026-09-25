@@ -342,8 +342,9 @@ automix = "off"
 # crossfade 模式的过渡秒数 (1-25)
 crossfadeSeconds = 5
 # 过渡模式下，当前歌曲剩余多少秒时开始预加载并分析下一首（过渡最长 25 秒）。
-# 离线分析只支持 MP3/WAV/OGG；FLAC 不分析，按歌词/默认交叉淡化过渡
-automixPreloadSeconds = 60
+# 离线分析只支持 MP3/WAV/OGG；FLAC 不分析，按歌词/默认交叉淡化过渡。
+# 默认 90：automixModels = "full" 时曲首分离在 8 核笔记本上约需 30 秒，60 秒可能赶不上过渡
+automixPreloadSeconds = 90
 # automix 模式按需下载的神经网络模型（不进安装包，选择后在后台下载，也可手动放入模型目录）：
 #   "none"  不下载，纯 DSP 估计速度与小节线（默认）
 #   "beat"  Beat This! 拍点模型（约 83MB）+ onnxruntime 动态库（约 10-20MB）：
