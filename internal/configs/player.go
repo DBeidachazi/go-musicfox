@@ -42,6 +42,12 @@ type BeepConfig struct {
 	Gapless bool `koanf:"gapless"`
 	// 提前多少秒预加载下一首
 	GaplessPreloadSeconds int `koanf:"gaplessPreloadSeconds"`
+	// 歌曲间过渡: off / crossfade / automix
+	Automix string `koanf:"automix"`
+	// crossfade 模式的过渡秒数 (1-25)
+	CrossfadeSeconds int `koanf:"crossfadeSeconds"`
+	// 过渡模式下提前多少秒预加载并分析下一首
+	AutomixPreloadSeconds int `koanf:"automixPreloadSeconds"`
 }
 
 // MpdConfig `mpd` 引擎专属配置

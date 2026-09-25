@@ -333,6 +333,17 @@ mp3Decoder = "go-mp3"
 gapless = false
 # 开始预加载下一首时，当前歌曲的剩余秒数
 gaplessPreloadSeconds = 15
+# 歌曲间过渡（仅 beep 引擎，仅顺序/列表循环/单曲循环模式），可选:
+#   "off"       关闭（默认），此时按 gapless 设置决定是否无缝衔接
+#   "crossfade" 固定时长交叉淡化，时长见 crossfadeSeconds
+#   "automix"   智能过渡：离线分析两首歌的速度、调性、响度、段落，自动选择接法与长度
+# 开启后会自动启用预加载；分析在后台进行，结果缓存在 cache/automix 下
+automix = "off"
+# crossfade 模式的过渡秒数 (1-25)
+crossfadeSeconds = 5
+# 过渡模式下，当前歌曲剩余多少秒时开始预加载并分析下一首（过渡最长 25 秒）。
+# 离线分析只支持 MP3/WAV/OGG；FLAC 不分析，按歌词/默认交叉淡化过渡
+automixPreloadSeconds = 60
 
 # `mpd` 引擎专属配置，需要安装mpd
 [player.mpd]

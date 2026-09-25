@@ -296,7 +296,8 @@ func (p *Player) PlaySong(song structs.Song, direction PlayDirection) {
 	}
 
 	errorx.Go(func() {
-		p.lyricService.SetSong(context.Background(), song)
+		_ = p.lyricService.SetSong(context.Background(), song)
+		p.reportAutomixLyrics(song.Id)
 	}, true)
 
 	p.Play(player.URLMusic{

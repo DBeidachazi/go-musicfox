@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/go-musicfox/go-musicfox/internal/configs"
@@ -17,13 +18,18 @@ import (
 )
 
 func (p *Player) maybePreloadGapless(position time.Duration) {
-	if !configs.AppConfig.Player.Beep.Gapless {
+	automixOn := player.AutomixEnabled()
+	if !configs.AppConfig.Player.Beep.Gapless && !automixOn {
 		return
 	}
 	gapless, ok := p.Player.(player.GaplessPlayer)
 	preloadSeconds := configs.AppConfig.Player.Beep.GaplessPreloadSeconds
 	if preloadSeconds <= 0 {
 		preloadSeconds = 15
+	}
+	if automixOn {
+		// 过渡最长 25 秒，且下一首要先下载、分析，提前量必须更大。
+		preloadSeconds = max(preloadSeconds, configs.AppConfig.Player.Beep.AutomixPreloadSeconds, 45)
 	}
 	if !ok || p.CurMusic().Duration-position > time.Duration(preloadSeconds)*time.Second {
 		return
@@ -103,7 +109,10 @@ func (p *Player) commitGaplessTransition(transition player.GaplessTransition) {
 	}
 	p.reporter.ReportEnd(transition.PlayedTime)
 	p.reporter.ReportStart(song)
-	errorx.Go(func() { p.lyricService.SetSong(context.Background(), song) }, true)
+	errorx.Go(func() {
+		_ = p.lyricService.SetSong(context.Background(), song)
+		p.reportAutomixLyrics(song.Id)
+	}, true)
 	p.LocatePlayingSong()
 	p.stateHandler.SetPlayingInfo(p.PlayingInfo())
 	p.updateDesktopLyrics()
@@ -126,4 +135,39 @@ func (p *Player) cancelGaplessPreload() {
 	p.gaplessLoading = false
 	p.gaplessTriedFor = 0
 	p.gaplessMu.Unlock()
+}
+
+// reportAutomixLyrics 把当前歌曲最后一句唱完的时刻告诉播放器，过渡据此避免两个人声叠在一起。
+//
+// 逐字歌词（YRC）带真实的行结束时间；普通 LRC 只有行首时间，按上游做法取最后一行 +5 秒。
+func (p *Player) reportAutomixLyrics(songID int64) {
+	am, ok := p.Player.(player.AutomixPlayer)
+	if !ok || !player.AutomixEnabled() {
+		return
+	}
+	state := p.lyricService.State()
+	var lastSung *float64
+	for i := len(state.YRCLines) - 1; i >= 0 && lastSung == nil; i-- {
+		line := state.YRCLines[i]
+		if line.IsBG || line.EndTime <= 0 {
+			continue
+		}
+		text := ""
+		for _, w := range line.Words {
+			text += w.Word
+		}
+		if strings.TrimSpace(text) != "" {
+			v := float64(line.EndTime) / 1000
+			lastSung = &v
+		}
+	}
+	for i := len(state.Fragments) - 1; i >= 0 && lastSung == nil; i-- {
+		content := strings.TrimSpace(state.Fragments[i].Content)
+		if content == "" || strings.Trim(content, ".。…·-— ") == "" {
+			continue
+		}
+		v := float64(state.Fragments[i].StartTimeMs)/1000 + 5
+		lastSung = &v
+	}
+	am.SetAutomixLyrics(songID, lastSung, len(state.Fragments) > 0 || len(state.YRCLines) > 0)
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/gopxl/beep/effects"
 	"github.com/gopxl/beep/speaker"
 
+	"github.com/go-musicfox/go-musicfox/internal/automix"
 	"github.com/go-musicfox/go-musicfox/internal/configs"
 	"github.com/go-musicfox/go-musicfox/internal/types"
 	"github.com/go-musicfox/go-musicfox/utils/app"
@@ -56,6 +57,7 @@ type beepPlayer struct {
 	gapless           *gaplessState
 	gaplessOutput     beep.Streamer
 	gaplessOutputRate beep.SampleRate
+	automix           *automixState
 
 	close chan struct{}
 
@@ -78,7 +80,15 @@ func NewBeepPlayer() *beepPlayer {
 		httpClient: &http.Client{},
 		close:      make(chan struct{}),
 	}
-	if configs.AppConfig.Player.Beep.Gapless {
+	if settings := AutomixSettings(); settings.Mode != automix.ModeOff {
+		p.automix = newAutomixState(settings)
+		p.gapless = newGaplessState()
+		if settings.Mode == automix.ModeAutomix {
+			p.gapless.onPrepared = func(prepared *preparedGapless) {
+				p.automix.ensureProfile(prepared.music, prepared.file.Name())
+			}
+		}
+	} else if configs.AppConfig.Player.Beep.Gapless {
 		p.gapless = newGaplessState()
 	}
 
@@ -116,6 +126,7 @@ func (p *beepPlayer) listen() {
 	}
 
 	cacheFile := filepath.Join(app.RuntimeDir(), "beep_playing")
+	removeStaleTempFiles(app.RuntimeDir())
 	for {
 		select {
 		case <-p.close:
@@ -164,8 +175,11 @@ func (p *beepPlayer) listen() {
 				}
 
 				// 边下载边播放
-				go func(ctx context.Context, cacheWFile *os.File, read io.ReadCloser) {
-					_, _ = iox.CopyClose(ctx, cacheWFile, read)
+				go func(ctx context.Context, cacheWFile *os.File, read io.ReadCloser, music URLMusic) {
+					_, copyErr := iox.CopyClose(ctx, cacheWFile, read)
+					if copyErr == nil && p.automix != nil {
+						go p.analyseCurrent(cacheFile, music)
+					}
 					p.l.Lock()
 					defer p.l.Unlock()
 					if p.curStreamer == nil {
@@ -194,7 +208,7 @@ func (p *beepPlayer) listen() {
 						p.ctrl.Streamer = beep.Seq(p.resampleStreamer(p.curFormat.SampleRate), beep.Callback(doneHandle))
 					}
 					p.cacheDownloaded = true
-				}(ctx, p.cacheWriter, reader)
+				}(ctx, p.cacheWriter, reader, p.curMusic)
 
 				N := 512
 				if p.curMusic.Type == Flac {
@@ -208,6 +222,9 @@ func (p *beepPlayer) listen() {
 			} else {
 				// 单曲循环以及歌单只有一首歌时不再请求网络
 				p.cacheDownloaded = true
+				if p.automix != nil {
+					go p.analyseCurrent(cacheFile, p.curMusic)
+				}
 				if p.cacheReader, err = os.OpenFile(cacheFile, os.O_RDONLY, 0o666); err != nil {
 					panic(err)
 				}
@@ -532,6 +549,9 @@ func (p *beepPlayer) reset() {
 	}
 	p.cacheDownloaded = false
 	p.spectrumConsumer = nil
+	if p.automix != nil {
+		p.automix.resetNoLock()
+	}
 	p.gaplessOutput = nil
 	p.gaplessOutputRate = 0
 	speaker.Clear()
@@ -547,24 +567,35 @@ func (p *beepPlayer) streamer(samples [][2]float64) (n int, ok bool) {
 			return filled, filled == len(samples)
 		}
 
-		current := beep.Streamer(p.curStreamer)
-		if p.gaplessOutput != nil {
-			current = p.gaplessOutput
+		current := p.currentOutput()
+		var (
+			chunk    int
+			streamOK bool
+			handled  bool
+		)
+		if p.automix != nil {
+			chunk, streamOK, handled = p.automixStream(samples[filled:], current, p.gaplessOutputRate)
 		}
-		var prepared *preparedGapless
-		chunk, streamOK, switched := streamAcrossBoundary(samples[filled:], current, func() beep.Streamer {
-			if p.gapless != nil {
-				prepared = p.gapless.takeIfReady(p.curMusic.Id)
+		if !handled {
+			var prepared *preparedGapless
+			var switched bool
+			chunk, streamOK, switched = streamAcrossBoundary(samples[filled:], current, func() beep.Streamer {
+				if p.gapless != nil {
+					prepared = p.gapless.takeIfReady(p.curMusic.Id)
+				}
+				if prepared == nil {
+					return nil
+				}
+				return prepared.stream
+			})
+			if p.automix != nil {
+				p.automix.feedMeter(samples[filled:filled+chunk], p.gaplessOutputRate)
 			}
-			if prepared == nil {
-				return nil
+			if switched {
+				p.finishGapless(prepared)
 			}
-			return prepared.stream
-		})
+		}
 		filled += chunk
-		if switched {
-			p.finishGapless(prepared)
-		}
 
 		// Spectrum: feed PCM samples to analyzer.
 		if p.spectrumConsumer != nil && chunk > 0 {
@@ -575,6 +606,13 @@ func (p *beepPlayer) streamer(samples [][2]float64) (n int, ok bool) {
 				samplesR[i] = float32(samples[filled-chunk+i][1])
 			}
 			p.spectrumConsumer(float64(sampleRate), samplesL, samplesR)
+		}
+
+		// automix 接管的一段可能没有填满（到点前的那一截，或过渡被放弃），
+		// 剩下的交给下一轮循环按原路径填，而不是把不满的缓冲交出去。
+		if handled && streamOK && chunk > 0 && filled < len(samples) {
+			p.l.Unlock()
+			continue
 		}
 
 		err := p.curStreamer.Err()
@@ -614,20 +652,37 @@ func (p *beepPlayer) streamer(samples [][2]float64) (n int, ok bool) {
 }
 
 func (p *beepPlayer) finishGapless(prepared *preparedGapless) {
+	p.swapToPreparedNoLock(prepared, false)()
+}
+
+// swapToPreparedNoLock 让预备好的下一首成为当前曲目，并通知 UI。
+// 旧曲目的资源由返回的函数释放：gapless 立即释放，automix 等出场曲混完再释放。
+func (p *beepPlayer) swapToPreparedNoLock(prepared *preparedGapless, keepOld bool) (release func()) {
 	old := p.curStreamer
 	var playedTime time.Duration
 	if p.timer != nil {
 		playedTime = p.timer.ActualRuntime()
 	}
-	if p.cacheReader != nil {
-		_ = p.cacheReader.Close()
+	oldReader, oldWriter, oldPath := p.cacheReader, p.cacheWriter, p.gaplessCachePath
+	p.cacheWriter = nil
+	release = func() {
+		if oldReader != nil {
+			_ = oldReader.Close()
+		}
+		if oldWriter != nil {
+			_ = oldWriter.Close()
+		}
+		if oldPath != "" {
+			_ = os.Remove(oldPath)
+		}
+		if old != nil {
+			_ = old.Close()
+		}
 	}
-	if p.cacheWriter != nil {
-		_ = p.cacheWriter.Close()
-		p.cacheWriter = nil
-	}
-	if p.gaplessCachePath != "" {
-		_ = os.Remove(p.gaplessCachePath)
+	if !keepOld {
+		release()
+		release = func() {}
+		old = nil
 	}
 	p.curMusic = prepared.music
 	p.curStreamer = prepared.raw
@@ -639,13 +694,11 @@ func (p *beepPlayer) finishGapless(prepared *preparedGapless) {
 	if p.timer != nil {
 		p.timer.Reset()
 	}
-	if old != nil {
-		_ = old.Close()
-	}
 	select {
 	case p.gapless.transitions <- GaplessTransition{Music: prepared.music, PlayedTime: playedTime}:
 	default:
 	}
+	return release
 }
 
 func (p *beepPlayer) resampleStreamer(old beep.SampleRate) beep.Streamer {
@@ -670,4 +723,17 @@ func (p *beepPlayer) RawSamples() RawSampleFrame {
 		return RawSampleFrame{}
 	}
 	return p.spectrum.RawSamples()
+}
+
+// removeStaleTempFiles 清理上次运行留下的预加载 / 分析临时文件。
+// 退出时仍在使用的 beep_gapless_* 不会被删除，长期积累可达数百 MB。
+func removeStaleTempFiles(dir string) {
+	for _, pattern := range []string{"beep_gapless_*", "beep_automix_*"} {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		for _, path := range matches {
+			if info, err := os.Stat(path); err == nil && time.Since(info.ModTime()) > 12*time.Hour {
+				_ = os.Remove(path)
+			}
+		}
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gopxl/beep"
 
@@ -17,12 +18,13 @@ import (
 )
 
 type preparedGapless struct {
-	fromID int64
-	music  URLMusic
-	raw    beep.StreamSeekCloser
-	stream beep.Streamer
-	format beep.Format
-	file   *os.File
+	fromID     int64
+	music      URLMusic
+	raw        beep.StreamSeekCloser
+	stream     beep.Streamer
+	format     beep.Format
+	file       *os.File
+	outputRate beep.SampleRate
 }
 
 func (p *preparedGapless) close() {
@@ -43,6 +45,8 @@ type gaplessState struct {
 	preloading  int64
 	cancelLoad  context.CancelFunc
 	transitions chan GaplessTransition
+	// onPrepared 下一首就绪、交出之前调用（automix 用它分析进场曲）。
+	onPrepared func(*preparedGapless)
 }
 
 func newGaplessState() *gaplessState {
@@ -129,6 +133,9 @@ func (g *gaplessState) preload(fromID int64, music URLMusic, outputRate beep.Sam
 
 	go func() {
 		prepared := prepareGapless(ctx, fromID, music, outputRate, client, closed)
+		if prepared != nil && g.onPrepared != nil && id == g.generation.Load() {
+			g.onPrepared(prepared)
+		}
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		if id != g.generation.Load() || g.preloading != music.Id {
@@ -152,6 +159,36 @@ func (g *gaplessState) takeIfReady(currentID int64) *preparedGapless {
 	prepared := g.preloaded
 	g.preloaded = nil
 	return prepared
+}
+
+// peekReady 下一首是否已为 currentID 准备好，不取出。
+func (g *gaplessState) peekReady(currentID int64) (URLMusic, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.preloaded == nil || g.preloaded.fromID != currentID {
+		return URLMusic{}, false
+	}
+	return g.preloaded.music, true
+}
+
+// skipPrepared 把已就绪的下一首预先向前解码 seconds 秒（丢弃），作为过渡的起播点。
+func (g *gaplessState) skipPrepared(currentID int64, seconds float64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	p := g.preloaded
+	if p == nil || p.fromID != currentID || p.outputRate == 0 {
+		return false
+	}
+	remaining := p.outputRate.N(time.Duration(seconds * float64(time.Second)))
+	buf := make([][2]float64, 4096)
+	for remaining > 0 {
+		n, ok := p.stream.Stream(buf[:min(len(buf), remaining)])
+		remaining -= n
+		if !ok || n == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func prepareGapless(ctx context.Context, fromID int64, music URLMusic, outputRate beep.SampleRate, client *http.Client, closed <-chan struct{}) *preparedGapless {
@@ -222,5 +259,5 @@ func prepareGapless(ctx context.Context, fromID int64, music URLMusic, outputRat
 		stream = beep.Resample(resampleQuiality, format.SampleRate, outputRate, raw)
 	}
 	slog.Info("gapless preload ready", "song_id", music.Id, "bytes", bytes, "sample_rate", format.SampleRate, "samples", raw.Len())
-	return &preparedGapless{fromID: fromID, music: music, raw: raw, stream: stream, format: format, file: file}
+	return &preparedGapless{fromID: fromID, music: music, raw: raw, stream: stream, format: format, file: file, outputRate: outputRate}
 }
