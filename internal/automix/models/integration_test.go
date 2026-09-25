@@ -78,12 +78,14 @@ func TestRealHtdemucs(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("separated %.1fs in %v", w.Duration(), time.Since(started))
-	var drums, other float64
-	for i := 0; i < w.Len(); i += 7 {
+	var drums, bass, vocals, other float64
+	for i := 0; i < w.Len(); i++ {
 		drums += math.Abs(w.Sample(automix.StemDrums, i)[0])
+		bass += math.Abs(w.Sample(automix.StemBass, i)[0])
+		vocals += math.Abs(w.Sample(automix.StemVocals, i)[0])
 		other += math.Abs(w.Sample(automix.StemOther, i)[0])
 	}
-	if drums == 0 || other == 0 {
-		t.Errorf("empty stems: drums %v other %v", drums, other)
+	if drums == 0 || bass == 0 || vocals == 0 || other == 0 {
+		t.Errorf("empty stems: drums %v bass %v vocals %v other %v", drums, bass, vocals, other)
 	}
 }

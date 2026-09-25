@@ -142,15 +142,15 @@ func pythonRuntime(extra []string) (Artifact, bool) {
 // onnxruntime 官方发布的 CPU 包，只取出动态库。版本与 folia 运行时里的一致；
 // Intel Mac 从 1.24 起不再有官方包，停在 1.23.2。
 //
-// 这些归档的 sha256 尚未钉住（见 Artifact.SHA256），下载时只校验来源（HTTPS + 官方仓库）
-// 并在日志里打印哈希；钉住后填进来即可。
-var ortPackages = map[string]struct{ version, asset, lib string }{
-	"linux-amd64":   {"1.29.0", "onnxruntime-linux-x64-1.29.0.tgz", "libonnxruntime.so.1.29.0"},
-	"linux-arm64":   {"1.29.0", "onnxruntime-linux-aarch64-1.29.0.tgz", "libonnxruntime.so.1.29.0"},
-	"darwin-arm64":  {"1.29.0", "onnxruntime-osx-arm64-1.29.0.tgz", "libonnxruntime.1.29.0.dylib"},
-	"darwin-amd64":  {"1.23.2", "onnxruntime-osx-x86_64-1.23.2.tgz", "libonnxruntime.1.23.2.dylib"},
-	"windows-amd64": {"1.29.0", "onnxruntime-win-x64-1.29.0.zip", "onnxruntime.dll"},
-	"windows-arm64": {"1.29.0", "onnxruntime-win-arm64-1.29.0.zip", "onnxruntime.dll"},
+// Windows x64 包的 sha256 已按官方 v1.29.0 发布资产钉住；其余平台尚未钉住
+// （见 Artifact.SHA256），下载时只校验来源并在日志里打印哈希，钉住后填进来即可。
+var ortPackages = map[string]struct{ version, asset, lib, sha string }{
+	"linux-amd64":   {"1.29.0", "onnxruntime-linux-x64-1.29.0.tgz", "libonnxruntime.so.1.29.0", ""},
+	"linux-arm64":   {"1.29.0", "onnxruntime-linux-aarch64-1.29.0.tgz", "libonnxruntime.so.1.29.0", ""},
+	"darwin-arm64":  {"1.29.0", "onnxruntime-osx-arm64-1.29.0.tgz", "libonnxruntime.1.29.0.dylib", ""},
+	"darwin-amd64":  {"1.23.2", "onnxruntime-osx-x86_64-1.23.2.tgz", "libonnxruntime.1.23.2.dylib", ""},
+	"windows-amd64": {"1.29.0", "onnxruntime-win-x64-1.29.0.zip", "onnxruntime.dll", "c9b4b7086b529ad814f428c1bad028e20a25d7dc0699836775faace4ab5b78b2"},
+	"windows-arm64": {"1.29.0", "onnxruntime-win-arm64-1.29.0.zip", "onnxruntime.dll", ""},
 }
 
 func ortLibrary() (Artifact, string, bool) {
@@ -159,7 +159,7 @@ func ortLibrary() (Artifact, string, bool) {
 		return Artifact{}, "", false
 	}
 	return Artifact{
-		Name: "onnxruntime", File: pkg.asset,
+		Name: "onnxruntime", File: pkg.asset, SHA256: pkg.sha,
 		URLs:   []string{fmt.Sprintf("https://github.com/microsoft/onnxruntime/releases/download/v%s/%s", pkg.version, pkg.asset)},
 		Unpack: ortDir,
 		// 只要动态库本身；Windows 上 providers_shared 与主库放在一起。

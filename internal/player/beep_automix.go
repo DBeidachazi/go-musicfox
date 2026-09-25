@@ -367,22 +367,35 @@ func (p *beepPlayer) analyseCurrent(path string, music URLMusic) {
 	p.automix.ensureStems(music, tmp, automix.RoleTail, rate)
 }
 
-// analyseNext 下一首预加载完成时：同步测档案（计划要用），曲首分离放到后台。
+// analyseNext 下一首预加载完成时：同步测档案（计划要用），曲首与曲尾分离放到后台。
+//
+// 曲尾也在这里分离：经过渡换上来的歌不走下载路径，analyseCurrent 不会为它运行，
+// 不在这里做，连续播放时只有第一首歌有曲尾窗口。曲首先分（几十秒后就要用），曲尾在后（整首歌之后才用）。
 func (p *beepPlayer) analyseNext(prepared *preparedGapless) {
 	a := p.automix
 	a.ensureProfile(prepared.music, prepared.file.Name())
-	if !a.claimStems(prepared.music.Id, automix.RoleHead) {
+	var roles []automix.StemRole
+	for _, role := range []automix.StemRole{automix.RoleHead, automix.RoleTail} {
+		if a.claimStems(prepared.music.Id, role) {
+			roles = append(roles, role)
+		}
+	}
+	if len(roles) == 0 {
 		return
 	}
-	// 预加载的临时文件在交出或取消时会被删除，分离要读它半分钟，先复制一份。
+	// 预加载的临时文件在交出或取消时会被删除，分离要读它一分钟，先复制一份。
 	tmp, err := copyToTemp(prepared.file.Name(), "beep_automix_*")
 	if err != nil {
-		a.storeStems(stemKey{prepared.music.Id, automix.RoleHead}, nil)
+		for _, role := range roles {
+			a.storeStems(stemKey{prepared.music.Id, role}, nil)
+		}
 		return
 	}
 	go func() {
 		defer os.Remove(tmp)
-		a.separateStems(prepared.music, tmp, automix.RoleHead, prepared.outputRate)
+		for _, role := range roles {
+			a.separateStems(prepared.music, tmp, role, prepared.outputRate)
+		}
 	}()
 }
 

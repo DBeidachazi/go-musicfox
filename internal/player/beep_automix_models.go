@@ -113,7 +113,13 @@ func (a *automixState) storeStems(k stemKey, w *automix.StemWindow) {
 // claimStems 占下一个待分离的窗口；已有、正在分离或模型不可用时返回 false。
 // 同步占位，使规划器在分离真正开始之前就知道要等它。
 func (a *automixState) claimStems(id int64, role automix.StemRole) bool {
-	if a.engine == nil || !a.engine.StemsReady() || id == 0 {
+	if a.engine == nil || id == 0 {
+		return false
+	}
+	if !a.engine.StemsReady() {
+		// 说出来：模型还在下载时静默跳过，从外面看和手法坏了一样。
+		slog.Info("automix skips separation, htdemucs not ready", "song_id", id, "role", role,
+			"status", a.engine.Store().Status())
 		return false
 	}
 	k := stemKey{id, role}
